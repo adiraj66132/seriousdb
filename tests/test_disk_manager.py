@@ -133,6 +133,49 @@ def test_failed_io_does_not_block_close(path):
     dm.close()
 
 
+def test_open_failure_is_wrapped(tmp_path):
+    with pytest.raises(DiskManagerError) as info:
+        DiskManager(tmp_path / "missing-dir" / "test.sdb")
+    assert isinstance(info.value.__cause__, OSError)
+
+
+def test_repair_failure_is_wrapped(path, monkeypatch):
+    path.write_bytes(page(1) + b"x")
+
+    def boom(*args):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(disk_manager.os, "ftruncate", boom)
+    with pytest.raises(DiskManagerError) as info:
+        DiskManager(path, repair_torn_page=True)
+    assert isinstance(info.value.__cause__, OSError)
+
+
+def test_read_write_sync_os_errors_are_wrapped(path, monkeypatch):
+    def boom(*args):
+        raise OSError("disk on fire")
+
+    with DiskManager(path) as dm:
+        dm.write_page(dm.allocate_page(), page(1))
+        with monkeypatch.context() as m:
+            m.setattr(dm, "_read_at", boom)
+            with pytest.raises(DiskManagerError) as info:
+                dm.read_page(UInt32(0))
+            assert isinstance(info.value.__cause__, OSError)
+        with monkeypatch.context() as m:
+            m.setattr(dm, "_write_all", boom)
+            with pytest.raises(DiskManagerError):
+                dm.write_page(UInt32(0), page(2))
+            with pytest.raises(DiskManagerError):
+                dm.allocate_page()
+        with monkeypatch.context() as m:
+            m.setattr(disk_manager.os, "fsync", boom)
+            with pytest.raises(DiskManagerError):
+                dm.sync()
+        # Failed calls must not leave the in-flight count raised.
+    assert dm.path == path
+
+
 def test_use_after_close_raises(path):
     dm = DiskManager(path)
     dm.close()

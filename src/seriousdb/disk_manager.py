@@ -23,6 +23,15 @@ _pwrite = getattr(os, "pwrite", None)
 _O_BINARY = getattr(os, "O_BINARY", 0)
 
 
+@contextmanager
+def _os_errors(path: Path) -> Iterator[None]:
+    """Re-raise any OSError as DiskManagerError, keeping it as the cause."""
+    try:
+        yield
+    except OSError as e:
+        raise DiskManagerError(f"I/O error on {path}: {e}") from e
+
+
 class DiskManager:
     """Read and write fixed-size pages of the database file by page ID.
 
@@ -57,20 +66,22 @@ class DiskManager:
         self._fd: int | None = None
         self._known_pages = 0
         self._active = 0  # I/O calls currently using the fd
-        fd = os.open(self._path, os.O_RDWR | os.O_CREAT | _O_BINARY, 0o644)
+        with _os_errors(self._path):
+            fd = os.open(self._path, os.O_RDWR | os.O_CREAT | _O_BINARY, 0o644)
         try:
-            size = os.fstat(fd).st_size
-            tail = size % PAGE_SIZE
-            if tail:
-                if not repair_torn_page:
-                    raise DiskManagerError(
-                        f"{self._path} is {size} bytes, not a multiple of "
-                        f"{PAGE_SIZE}; the last page is incomplete"
-                    )
-                size -= tail
-                os.ftruncate(fd, size)
-                os.fsync(fd)
-            self._known_pages = size // PAGE_SIZE
+            with _os_errors(self._path):
+                size = os.fstat(fd).st_size
+                tail = size % PAGE_SIZE
+                if tail:
+                    if not repair_torn_page:
+                        raise DiskManagerError(
+                            f"{self._path} is {size} bytes, not a multiple of "
+                            f"{PAGE_SIZE}; the last page is incomplete"
+                        )
+                    size -= tail
+                    os.ftruncate(fd, size)
+                    os.fsync(fd)
+                self._known_pages = size // PAGE_SIZE
         except BaseException:
             os.close(fd)
             raise
@@ -147,7 +158,13 @@ class DiskManager:
             return UInt32(count)
 
     def sync(self) -> None:
-        """Flush file contents and size to stable storage (fsync)."""
+        """Flush file contents and size to stable storage (``fsync``).
+
+        Raises
+        ------
+        DiskManagerError
+            If the file is closed or the flush fails.
+        """
         with self._in_flight() as fd:
             os.fsync(fd)
 
@@ -157,14 +174,16 @@ class DiskManager:
         Raises
         ------
         DiskManagerError
-            If a read, write, allocation or sync is still running.
+            If a read, write, allocation or sync is still running, or the
+            file cannot be closed.
         """
         with self._lock:
             if self._active:
                 raise DiskManagerError("cannot close while I/O is in progress")
             if self._fd is not None:
-                os.close(self._fd)
-                self._fd = None
+                fd, self._fd = self._fd, None
+                with _os_errors(self._path):
+                    os.close(fd)
 
     def __enter__(self) -> Self:
         """Return the manager for use in a ``with`` block."""
@@ -181,7 +200,8 @@ class DiskManager:
             fd = self._require_open()
             self._active += 1
         try:
-            yield fd
+            with _os_errors(self._path):
+                yield fd
         finally:
             with self._lock:
                 self._active -= 1
